@@ -1,0 +1,15 @@
+# Binaries
+/s1
+/s2
+*.exe
+
+# Key share data (never commit secrets)
+/data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
