@@ -22,6 +22,15 @@ type Signature struct {
 	V int    `json:"v"` // recovery ID (0 or 1)
 }
 
+// InitMessage is sent from the initiator to tell the peer to join a signing session.
+type InitMessage struct {
+	SessionID string `json:"session_id"`
+	KeyID     string `json:"key_id"`
+	Digest    string `json:"digest"` // hex-encoded
+	Threshold int    `json:"threshold"`
+	Parties   int    `json:"parties"`
+}
+
 // WireMessage is the serializable form of a tss-lib protocol message.
 type WireMessage struct {
 	FromID      string `json:"from_id"`
@@ -43,13 +52,43 @@ func NewHandler(nodeID string, t *transport.Transport) *Handler {
 	}
 }
 
-// Sign executes the GG20 signing protocol for a given digest using the provided key share.
-func (h *Handler) Sign(sessionID string, digest []byte, shareData *keygen.LocalPartySaveData, parties int, threshold int) (*Signature, error) {
+// Run initiates a signing session — sends sign_init to the peer, then runs the protocol.
+func (h *Handler) Run(sessionID string, keyID string, digest []byte, saveData *keygen.LocalPartySaveData, parties int, threshold int) (*Signature, error) {
+	log.Printf("[%s] initiating signing session=%s", h.nodeID, sessionID)
+
+	initPayload, _ := json.Marshal(InitMessage{
+		SessionID: sessionID,
+		KeyID:     keyID,
+		Digest:    fmt.Sprintf("%x", digest),
+		Threshold: threshold,
+		Parties:   parties,
+	})
+	err := h.transport.Send(&transport.Message{
+		Type:      "sign_init",
+		SessionID: sessionID,
+		Payload:   initPayload,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("send sign_init: %w", err)
+	}
+
+	return h.runProtocol(sessionID, digest, saveData, parties, threshold)
+}
+
+// Join is called on the peer side when it receives a sign_init message.
+func (h *Handler) Join(sessionID string, digest []byte, saveData *keygen.LocalPartySaveData, parties int, threshold int) (*Signature, error) {
+	log.Printf("[%s] joining signing session=%s", h.nodeID, sessionID)
+	return h.runProtocol(sessionID, digest, saveData, parties, threshold)
+}
+
+// runProtocol executes the GG20 signing protocol.
+func (h *Handler) runProtocol(sessionID string, digest []byte, shareData *keygen.LocalPartySaveData, parties int, threshold int) (*Signature, error) {
 	if len(digest) != 32 {
 		return nil, fmt.Errorf("digest must be 32 bytes, got %d", len(digest))
 	}
 
-	log.Printf("[%s] starting signing session=%s", h.nodeID, sessionID)
+	msgCh := h.transport.Subscribe(sessionID)
+	defer h.transport.Unsubscribe(sessionID)
 
 	// Set up party IDs (must match DKG)
 	partyIDs := make(tss.UnSortedPartyIDs, parties)
@@ -133,8 +172,8 @@ func (h *Handler) Sign(sessionID string, digest []byte, shareData *keygen.LocalP
 				return nil, fmt.Errorf("send tss message: %w", err)
 			}
 
-		case wsMsg := <-h.transport.Receive():
-			if wsMsg.Type != "sign" || wsMsg.SessionID != sessionID {
+		case wsMsg := <-msgCh:
+			if wsMsg.Type != "sign" {
 				continue
 			}
 
@@ -158,12 +197,12 @@ func (h *Handler) Sign(sessionID string, digest []byte, shareData *keygen.LocalP
 				log.Printf("[%s] party update returned false", h.nodeID)
 			}
 
-		case sigData := <-endCh:
+		case sigData := <-endCh: //nolint:govet // tss-lib SignatureData contains protobuf mutex, safe to copy once
 			log.Printf("[%s] signing complete!", h.nodeID)
 			return &Signature{
-				R: padTo32(sigData.R),
-				S: padTo32(sigData.S),
-				V: int(sigData.SignatureRecovery[0]),
+				R: padTo32(sigData.GetR()),
+				S: padTo32(sigData.GetS()),
+				V: int(sigData.GetSignatureRecovery()[0]),
 			}, nil
 
 		case <-timeout:

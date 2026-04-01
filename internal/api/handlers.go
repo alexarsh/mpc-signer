@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bnb-chain/tss-lib/ecdsa/keygen"
 	"github.com/gin-gonic/gin"
 
 	"github.com/alexarsh/mpc-signer/internal/derivation"
@@ -55,6 +56,8 @@ func (s *Server) StartProtocolListener() {
 			switch msg.Type {
 			case "dkg_init":
 				go s.handleDKGInit(msg)
+			case "sign_init":
+				go s.handleSignInit(msg)
 			default:
 				log.Printf("[%s] unhandled message type: %s", s.nodeID, msg.Type)
 			}
@@ -97,8 +100,64 @@ func (s *Server) handleDKGInit(msg *transport.Message) {
 		return
 	}
 
+	// Save full tss-lib save data for signing
+	tssDataBytes, err := json.Marshal(result.SaveData)
+	if err != nil {
+		log.Printf("[%s] failed to marshal tss save data: %v", s.nodeID, err)
+		return
+	}
+	if err := s.store.SaveTSSData(init.KeyID, tssDataBytes); err != nil {
+		log.Printf("[%s] failed to save tss data: %v", s.nodeID, err)
+		return
+	}
+
 	address, _ := tron.AddressFromPublicKey(result.PublicKey)
 	log.Printf("[%s] DKG complete! key=%s address=%s", s.nodeID, init.KeyID, address)
+}
+
+func (s *Server) handleSignInit(msg *transport.Message) {
+	var init signer.InitMessage
+	if err := json.Unmarshal(msg.Payload, &init); err != nil {
+		log.Printf("[%s] failed to parse sign_init: %v", s.nodeID, err)
+		return
+	}
+
+	log.Printf("[%s] received sign_init: session=%s key=%s", s.nodeID, init.SessionID, init.KeyID)
+
+	// Load tss-lib save data
+	saveData, err := s.loadTSSData(init.KeyID)
+	if err != nil {
+		log.Printf("[%s] failed to load tss data for signing: %v", s.nodeID, err)
+		return
+	}
+
+	digest, err := hex.DecodeString(init.Digest)
+	if err != nil {
+		log.Printf("[%s] failed to decode digest: %v", s.nodeID, err)
+		return
+	}
+
+	sig, err := s.signer.Join(init.SessionID, digest, saveData, init.Parties, init.Threshold)
+	if err != nil {
+		log.Printf("[%s] signing join failed: %v", s.nodeID, err)
+		return
+	}
+
+	log.Printf("[%s] signing complete! key=%s r=%x", s.nodeID, init.KeyID, sig.R)
+}
+
+func (s *Server) loadTSSData(keyID string) (*keygen.LocalPartySaveData, error) {
+	tssBytes, err := s.store.LoadTSSData(keyID)
+	if err != nil {
+		return nil, err
+	}
+
+	var saveData keygen.LocalPartySaveData
+	if err := json.Unmarshal(tssBytes, &saveData); err != nil {
+		return nil, fmt.Errorf("unmarshal tss data: %w", err)
+	}
+
+	return &saveData, nil
 }
 
 // --- Request / Response types ---
@@ -208,6 +267,17 @@ func (s *Server) keygen(c *gin.Context) {
 		return
 	}
 
+	// Save full tss-lib save data for signing
+	tssDataBytes, err := json.Marshal(result.SaveData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("marshal tss data: %v", err)})
+		return
+	}
+	if err := s.store.SaveTSSData(req.KeyID, tssDataBytes); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save tss data: %v", err)})
+		return
+	}
+
 	address, err := tron.AddressFromPublicKey(result.PublicKey)
 	if err != nil {
 		address = "derivation-error"
@@ -295,7 +365,7 @@ func (s *Server) sign(c *gin.Context) {
 		return
 	}
 
-	_, _, err = s.store.Load(req.KeyID)
+	_, meta, err := s.store.Load(req.KeyID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("key not found: %v", err)})
 		return
@@ -308,15 +378,24 @@ func (s *Server) sign(c *gin.Context) {
 		}
 	}
 
-	// Placeholder: signing requires persisting full tss-lib LocalPartySaveData
-	sessionID := fmt.Sprintf("sign-%s-%d", req.KeyID, time.Now().UnixNano())
-	_ = sessionID
+	saveData, err := s.loadTSSData(req.KeyID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("load tss data: %v", err)})
+		return
+	}
 
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error":   "signing protocol wiring in progress",
-		"message": "DKG save data needs to be persisted in tss-lib format for signing. See signer.Sign() for the protocol implementation.",
-		"key_id":  req.KeyID,
-		"digest":  req.Digest,
+	sessionID := fmt.Sprintf("sign-%s-%d", req.KeyID, time.Now().UnixNano())
+	sig, err := s.signer.Run(sessionID, req.KeyID, digest, saveData, meta.Parties, meta.Threshold)
+	if err != nil {
+		log.Printf("[%s] signing failed: %v", s.nodeID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("signing failed: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, SignResponse{
+		R: hex.EncodeToString(sig.R),
+		S: hex.EncodeToString(sig.S),
+		V: sig.V,
 	})
 }
 

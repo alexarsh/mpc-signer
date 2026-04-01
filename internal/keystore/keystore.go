@@ -126,6 +126,45 @@ func (s *Store) Load(keyID string) (*ShareData, *Metadata, error) {
 	return &share, &meta, nil
 }
 
+// SaveTSSData encrypts and stores the full tss-lib LocalPartySaveData.
+func (s *Store) SaveTSSData(keyID string, data []byte) error {
+	keyDir := filepath.Join(s.baseDir, keyID)
+	if err := os.MkdirAll(keyDir, 0700); err != nil {
+		return fmt.Errorf("create key dir: %w", err)
+	}
+
+	encrypted, err := encrypt(data, s.passphrase)
+	if err != nil {
+		return fmt.Errorf("encrypt tss data: %w", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(keyDir, "tss_save_data.enc"), encrypted, 0600); err != nil {
+		return fmt.Errorf("write tss data: %w", err)
+	}
+
+	return nil
+}
+
+// LoadTSSData decrypts and returns the full tss-lib LocalPartySaveData bytes.
+func (s *Store) LoadTSSData(keyID string) ([]byte, error) {
+	keyDir := filepath.Join(s.baseDir, keyID)
+
+	encrypted, err := os.ReadFile(filepath.Join(keyDir, "tss_save_data.enc"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("tss data for key %q not found", keyID)
+		}
+		return nil, fmt.Errorf("read tss data: %w", err)
+	}
+
+	plaintext, err := decrypt(encrypted, s.passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt tss data: %w", err)
+	}
+
+	return plaintext, nil
+}
+
 // Exists checks if a key share exists.
 func (s *Store) Exists(keyID string) bool {
 	keyDir := filepath.Join(s.baseDir, keyID)

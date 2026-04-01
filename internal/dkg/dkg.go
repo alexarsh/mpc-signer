@@ -21,6 +21,7 @@ type Result struct {
 	Share     []byte // this node's private key share (secret)
 	PublicKey []byte // combined public key (uncompressed, 65 bytes with 0x04 prefix)
 	ChainCode []byte // BIP32 chain code (32 bytes)
+	SaveData  *keygen.LocalPartySaveData // full tss-lib save data (needed for signing)
 }
 
 // InitMessage is sent from the initiator to tell the peer to join a DKG session.
@@ -228,5 +229,6 @@ func extractResult(data *keygen.LocalPartySaveData) (*Result, error) {
 		Share:     shareBytes,
 		PublicKey: pubKey,
 		ChainCode: chainCode,
+		SaveData:  data,
 	}, nil
 }
