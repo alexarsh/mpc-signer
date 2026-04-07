@@ -129,6 +129,69 @@ func ParsePath(path string) ([]uint32, error) {
 	return indices, nil
 }
 
+// DeriveTweakFromPath computes the cumulative BIP32 non-hardened tweak scalar
+// and the resulting child public key + chain code, using only public data.
+// The tweak can be added to any Shamir share or to the full private key to
+// produce the child key. Used to derive child tss-lib save data for signing.
+func DeriveTweakFromPath(
+	parentPubKey []byte,
+	chainCode []byte,
+	path string,
+) (tweak []byte, childPubKey []byte, childChainCode []byte, err error) {
+	indices, err := ParsePath(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	curveOrder := btcec.S256().N
+	totalTweak := new(big.Int)
+	curPub := parentPubKey
+	curCC := chainCode
+
+	for _, idx := range indices {
+		if idx >= 0x80000000 {
+			return nil, nil, nil, fmt.Errorf("hardened derivation (index >= 0x80000000) not supported")
+		}
+
+		compressedPub, cerr := compressPublicKey(curPub)
+		if cerr != nil {
+			return nil, nil, nil, fmt.Errorf("compress pub: %w", cerr)
+		}
+
+		data := make([]byte, 33+4)
+		copy(data[:33], compressedPub)
+		binary.BigEndian.PutUint32(data[33:], idx)
+
+		mac := hmac.New(sha512.New, curCC)
+		mac.Write(data)
+		I := mac.Sum(nil)
+
+		IL := I[:32]
+		IR := I[32:]
+
+		ilInt := new(big.Int).SetBytes(IL)
+		if ilInt.Cmp(curveOrder) >= 0 || ilInt.Sign() == 0 {
+			return nil, nil, nil, fmt.Errorf("invalid IL at index %d", idx)
+		}
+
+		totalTweak.Add(totalTweak, ilInt)
+		totalTweak.Mod(totalTweak, curveOrder)
+
+		// child pubkey = parent pubkey + IL*G
+		ilX, ilY := btcec.S256().ScalarBaseMult(IL)
+		parX, parY := unmarshalPubKey(curPub)
+		childX, childY := btcec.S256().Add(parX, parY, ilX, ilY)
+		curPub = marshalUncompressed(childX, childY)
+		curCC = IR
+	}
+
+	if totalTweak.Sign() == 0 {
+		return nil, nil, nil, fmt.Errorf("cumulative tweak is zero")
+	}
+
+	return padTo32(totalTweak.Bytes()), curPub, curCC, nil
+}
+
 // DeriveChildShareFromPath derives through multiple levels (e.g., "0/42" = two derivations).
 func DeriveChildShareFromPath(
 	parentShare []byte,

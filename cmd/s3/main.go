@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config/s1.yaml", "path to config file")
+	configPath := flag.String("config", "config/s3.yaml", "path to config file")
 	flag.Parse()
 
 	// Load config
@@ -24,7 +24,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	log.Printf("Starting MPC Node %s (WebSocket hub)", cfg.Node.ID)
+	log.Printf("Starting MPC Node %s (WebSocket client)", cfg.Node.ID)
 
 	// Initialize keystore
 	store, err := keystore.NewStore(cfg.Keystore.Dir, cfg.Keystore.Passphrase)
@@ -32,20 +32,23 @@ func main() {
 		log.Fatalf("init keystore: %v", err)
 	}
 
-	// S1 is the WebSocket hub — S2 and S3 connect to it
-	ws := transport.NewHub(cfg.Node.ID)
+	// S3 is a WebSocket client — connects to S1 (hub)
+	wsURL := fmt.Sprintf("ws://%s:%d/ws", cfg.Peer.Host, cfg.Peer.Port)
 
-	// Start WebSocket server on a separate port
-	wsPort := cfg.Peer.Port
-	wsMux := http.NewServeMux()
-	wsMux.HandleFunc("/ws", ws.HandleConnection)
-	go func() {
-		wsAddr := fmt.Sprintf("0.0.0.0:%d", wsPort)
-		log.Printf("[%s] WebSocket hub listening on %s", cfg.Node.ID, wsAddr)
-		if err := http.ListenAndServe(wsAddr, wsMux); err != nil {
-			log.Fatalf("WebSocket server: %v", err)
+	// Retry connection to S1 (S1 might not be up yet)
+	var ws *transport.Transport
+	for i := 0; i < 10; i++ {
+		ws, err = transport.NewClient(cfg.Node.ID, wsURL)
+		if err == nil {
+			break
 		}
-	}()
+		log.Printf("[%s] waiting for S1 at %s... (%d/10)", cfg.Node.ID, wsURL, i+1)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("connect to S1: %v", err)
+	}
+	log.Printf("[%s] connected to S1 at %s", cfg.Node.ID, wsURL)
 
 	// Set up REST API
 	r := gin.Default()

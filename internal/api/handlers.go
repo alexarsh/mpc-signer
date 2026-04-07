@@ -122,22 +122,29 @@ func (s *Server) handleSignInit(msg *transport.Message) {
 		return
 	}
 
-	log.Printf("[%s] received sign_init: session=%s key=%s", s.nodeID, init.SessionID, init.KeyID)
+	log.Printf("[%s] received sign_init: session=%s key=%s signers=%v", s.nodeID, init.SessionID, init.KeyID, init.Signers)
+
+	// Subscribe EARLY to buffer protocol messages while we load tss data.
+	// Without this, the initiator may send messages before we're ready,
+	// causing them to land in the default channel and be lost.
+	msgCh := s.signer.Subscribe(init.SessionID)
 
 	// Load tss-lib save data
 	saveData, err := s.loadTSSData(init.KeyID)
 	if err != nil {
+		s.transport.Unsubscribe(init.SessionID)
 		log.Printf("[%s] failed to load tss data for signing: %v", s.nodeID, err)
 		return
 	}
 
 	digest, err := hex.DecodeString(init.Digest)
 	if err != nil {
+		s.transport.Unsubscribe(init.SessionID)
 		log.Printf("[%s] failed to decode digest: %v", s.nodeID, err)
 		return
 	}
 
-	sig, err := s.signer.Join(init.SessionID, digest, saveData, init.Parties, init.Threshold)
+	sig, err := s.signer.Join(init.SessionID, digest, saveData, init.Signers, msgCh)
 	if err != nil {
 		log.Printf("[%s] signing join failed: %v", s.nodeID, err)
 		return
@@ -184,20 +191,22 @@ type DeriveChildRequest struct {
 type DeriveChildResponse struct {
 	ChildKeyID string `json:"child_key_id"`
 	PublicKey  string `json:"public_key"` // hex
-	ChainCode  string `json:"chain_code"` // hex
-	Address    string `json:"address"`    // TRON address
-	Path       string `json:"path"`
+	ChainCode string `json:"chain_code"` // hex
+	Address   string `json:"address"`    // TRON address
+	Path      string `json:"path"`
 }
 
 type SignRequest struct {
-	KeyID  string `json:"key_id" binding:"required"`
-	Digest string `json:"digest" binding:"required"` // hex-encoded 32-byte SHA256
+	KeyID   string   `json:"key_id" binding:"required"`
+	Digest  string   `json:"digest" binding:"required"` // hex-encoded 32-byte SHA256
+	Signers []string `json:"signers"`                   // optional: which 2 nodes sign, e.g. ["s1", "s2"]
 }
 
 type SignResponse struct {
-	R string `json:"r"` // hex
-	S string `json:"s"` // hex
-	V int    `json:"v"` // recovery ID
+	R       string   `json:"r"`       // hex
+	S       string   `json:"s"`       // hex
+	V       int      `json:"v"`       // recovery ID
+	Signers []string `json:"signers"` // which 2 nodes signed
 }
 
 type ValidateAddressRequest struct {
@@ -215,10 +224,10 @@ type ValidateAddressResponse struct {
 
 func (s *Server) healthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"status":    "ok",
-		"node_id":   s.nodeID,
-		"peer":      s.transport.IsConnected(),
-		"timestamp": time.Now().UTC(),
+		"status":          "ok",
+		"node_id":         s.nodeID,
+		"connected_peers": s.transport.ConnectedPeers(),
+		"timestamp":       time.Now().UTC(),
 	})
 }
 
@@ -234,9 +243,11 @@ func (s *Server) keygen(c *gin.Context) {
 		return
 	}
 
-	if !s.transport.IsConnected() {
-		if err := s.transport.WaitForPeer(30 * time.Second); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "peer not connected"})
+	// For 3-party DKG, need both peers connected
+	expectedPeers := req.Parties - 1
+	if len(s.transport.ConnectedPeers()) < expectedPeers {
+		if err := s.transport.WaitForPeers(expectedPeers, 30*time.Second); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("need %d peers connected, have %d", expectedPeers, len(s.transport.ConnectedPeers()))})
 			return
 		}
 	}
@@ -304,6 +315,28 @@ func (s *Server) deriveChild(c *gin.Context) {
 		return
 	}
 
+	// Idempotency: if this child was already derived, return the existing
+	// data instead of redoing the tweak + overwriting the saved tss data.
+	// Derivation is deterministic so the result is guaranteed to match.
+	existingID := fmt.Sprintf("child_%s", pathToID(req.Path))
+	if s.store.Exists(existingID) {
+		existingShare, _, err := s.store.Load(existingID)
+		if err == nil {
+			address, aerr := tron.AddressFromPublicKey(existingShare.PublicKey)
+			if aerr != nil {
+				address = "derivation-error"
+			}
+			c.JSON(http.StatusOK, DeriveChildResponse{
+				ChildKeyID: existingID,
+				PublicKey:  hex.EncodeToString(existingShare.PublicKey),
+				ChainCode:  hex.EncodeToString(existingShare.ChainCode),
+				Address:    address,
+				Path:       req.Path,
+			})
+			return
+		}
+	}
+
 	result, err := derivation.DeriveChildShareFromPath(
 		share.Share,
 		share.PublicKey,
@@ -325,12 +358,40 @@ func (s *Server) deriveChild(c *gin.Context) {
 		KeyID:     childKeyID,
 		Path:      req.Path,
 		Threshold: 2,
-		Parties:   2,
+		Parties:   3,
 		CreatedAt: time.Now().UTC(),
 	}
 
 	if err := s.store.Save(childKeyID, childShare, childMeta); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save child share: %v", err)})
+		return
+	}
+
+	// Also derive and persist tweaked tss-lib save data so the child key can be
+	// used directly by /mpc/sign (same additive BIP32 tweak applied to Xi, BigXj
+	// and ECDSAPub). Each node does this independently — no communication needed.
+	masterSaveData, err := s.loadTSSData(req.MasterKeyID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("load master tss data: %v", err)})
+		return
+	}
+	tweakedSaveData, _, _, err := derivation.TweakTSSDataForPath(
+		masterSaveData,
+		share.PublicKey,
+		share.ChainCode,
+		req.Path,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("tweak tss data: %v", err)})
+		return
+	}
+	tweakedBytes, err := json.Marshal(tweakedSaveData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("marshal tweaked tss data: %v", err)})
+		return
+	}
+	if err := s.store.SaveTSSData(childKeyID, tweakedBytes); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("save tweaked tss data: %v", err)})
 		return
 	}
 
@@ -365,17 +426,50 @@ func (s *Server) sign(c *gin.Context) {
 		return
 	}
 
-	_, meta, err := s.store.Load(req.KeyID)
+	_, _, err = s.store.Load(req.KeyID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("key not found: %v", err)})
 		return
 	}
 
-	if !s.transport.IsConnected() {
-		if err := s.transport.WaitForPeer(10 * time.Second); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "peer not connected"})
+	// Determine which 2 nodes will sign
+	signers := req.Signers
+	if len(signers) == 0 {
+		// Auto-select: this node + first available peer
+		signers, err = s.autoSelectSigners()
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
+	}
+
+	// Validate signers
+	if len(signers) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly 2 signers required for 2-of-3 threshold"})
+		return
+	}
+	if !contains(signers, s.nodeID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("this node (%s) must be one of the signers", s.nodeID)})
+		return
+	}
+
+	// Check co-signer is connected
+	coSigner := ""
+	for _, id := range signers {
+		if id != s.nodeID {
+			coSigner = id
+			break
+		}
+	}
+	if !s.transport.IsPeerConnected(coSigner) {
+		// Try fallback to another peer
+		fallbackSigners, fbErr := s.autoSelectSigners()
+		if fbErr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("co-signer %s not connected and no fallback available", coSigner)})
+			return
+		}
+		signers = fallbackSigners
+		log.Printf("[%s] co-signer %s unavailable, falling back to %v", s.nodeID, coSigner, signers)
 	}
 
 	saveData, err := s.loadTSSData(req.KeyID)
@@ -385,7 +479,7 @@ func (s *Server) sign(c *gin.Context) {
 	}
 
 	sessionID := fmt.Sprintf("sign-%s-%d", req.KeyID, time.Now().UnixNano())
-	sig, err := s.signer.Run(sessionID, req.KeyID, digest, saveData, meta.Parties, meta.Threshold)
+	sig, err := s.signer.Run(sessionID, req.KeyID, digest, saveData, signers)
 	if err != nil {
 		log.Printf("[%s] signing failed: %v", s.nodeID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("signing failed: %v", err)})
@@ -393,10 +487,22 @@ func (s *Server) sign(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, SignResponse{
-		R: hex.EncodeToString(sig.R),
-		S: hex.EncodeToString(sig.S),
-		V: sig.V,
+		R:       hex.EncodeToString(sig.R),
+		S:       hex.EncodeToString(sig.S),
+		V:       sig.V,
+		Signers: signers,
 	})
+}
+
+// autoSelectSigners picks this node + the first available connected peer.
+// On client nodes the roster is learned from the hub, so we see real node IDs
+// (e.g. s1, s3) instead of only "hub".
+func (s *Server) autoSelectSigners() ([]string, error) {
+	peers := s.transport.ConnectedPeers()
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("no peers connected — need at least 1 peer for 2-of-3 signing")
+	}
+	return []string{s.nodeID, peers[0]}, nil
 }
 
 func (s *Server) validateAddress(c *gin.Context) {
@@ -426,4 +532,13 @@ func pathToID(path string) string {
 		}
 	}
 	return result
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }

@@ -1,18 +1,18 @@
 node:
-  id: "s1"
-  port: 18551
+  id: "s3"
+  port: 18553
 
 peer:
   host: "localhost"
   port: 19552
-  role: "hub"  # S1 is WebSocket hub — S2 and S3 connect to it
+  role: "client"  # S3 connects to S1's WebSocket
 
 api:
   host: "0.0.0.0"
-  port: 18551
+  port: 18553
 
 keystore:
-  dir: "./data/s1/keystore"
+  dir: "./data/s3/keystore"
   passphrase: "poc-only-change-in-prod"
 
 tron:

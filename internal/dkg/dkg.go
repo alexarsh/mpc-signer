@@ -68,6 +68,7 @@ func (h *Handler) Run(sessionID, keyID string, threshold, parties int) (*Result,
 	err := h.transport.Send(&transport.Message{
 		Type:      "dkg_init",
 		SessionID: sessionID,
+		To:        "all", // broadcast to all peers (S2 and S3)
 		Payload:   initPayload,
 	})
 	if err != nil {

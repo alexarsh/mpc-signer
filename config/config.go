@@ -15,7 +15,7 @@ type Config struct {
 }
 
 type NodeConfig struct {
-	ID   string `yaml:"id"`   // "s1" or "s2"
+	ID   string `yaml:"id"`   // "s1", "s2", or "s3"
 	Port int    `yaml:"port"` // REST API port
 }
 
